@@ -1,0 +1,126 @@
+# Pipeline CI/CD — CRUD de productos de un restaurante
+# Flujo: push -> build & test -> docker build/push -> deploy (con verificación)
+name: Pipeline CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ── JOB 1: instalar dependencias + pruebas unitarias ──────────────────────
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ejecutar pruebas unitarias
+        run: pytest tests/unit/ --cov=src --cov-report=xml:coverage.xml --cov-report=term-missing -v
+
+      - name: Guardar reporte de cobertura
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 30
+
+  # ── JOB 2: construir imagen Docker y publicarla en GHCR ───────────────────
+  docker-build:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generar metadata de la imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+
+      - name: Build & Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── JOB 3: despliegue (arranca el contenedor y verifica que responde) ─────
+  deploy:
+    name: Deploy a Runtime
+    runs-on: ubuntu-latest
+    needs: docker-build
+    permissions:
+      contents: read
+      packages: read
+    environment: ${{ github.ref == 'refs/heads/main' && 'production' || 'staging' }}
+    steps:
+      - name: Login a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Desplegar contenedor
+        run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ github.repository }}:${{ github.ref_name }}" | tr '[:upper:]' '[:lower:]')
+          docker pull "$IMAGE"
+          docker run -d --name restaurante -p 8000:8000 "$IMAGE"
+          sleep 5
+
+      - name: Verificación post-despliegue (smoke test)
+        run: |
+          curl --fail http://localhost:8000/salud
+          curl --fail -X POST http://localhost:8000/productos \
+            -H "Content-Type: application/json" \
+            -d '{"nombre":"Hamburguesa","precio":15000,"categoria":"Platos fuertes"}'
+          curl --fail "http://localhost:8000/productos?buscar=Hamburguesa"
+
+      - name: Mostrar logs si falla
+        if: failure()
+        run: docker logs restaurante
+
+      - name: Notificar resultado
+        if: always()
+        run: echo "Deploy ${{ job.status }} en ${{ github.ref_name }} @ ${GITHUB_SHA:0:7}"
